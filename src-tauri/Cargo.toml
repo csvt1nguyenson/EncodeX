@@ -1,6 +1,6 @@
 [package]
 name = "encodex-tauri"
-version = "0.4.1"
+version = "0.4.2"
 description = "EncodeX — Batch Media Encoder for Windows"
 authors = ["EncodeX"]
 edition = "2021"
