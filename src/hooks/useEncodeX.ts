@@ -110,15 +110,9 @@ export function useEncodeX() {
       const result = await tauriApi.checkForUpdates();
       if (result.hasUpdate) {
         setAvailableUpdate(result);
-        if (silent) {
-          if (notifiedVersionRef.current !== result.latestVersion) {
-            notifiedVersionRef.current = result.latestVersion;
-            toast.info(`Update available: v${result.latestVersion}`, {
-              duration: Infinity,
-              action: { label: "View", onClick: () => setUpdateDialogOpen(true) },
-            });
-          }
-        } else {
+        // Background checks pop up once per version, so "Later" is respected until the next launch.
+        if (!silent || notifiedVersionRef.current !== result.latestVersion) {
+          notifiedVersionRef.current = result.latestVersion;
           setUpdateDialogOpen(true);
         }
       } else {
