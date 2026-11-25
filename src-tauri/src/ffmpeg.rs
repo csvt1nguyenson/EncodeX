@@ -115,12 +115,31 @@ pub fn probe_info_sync(path: &str) -> serde_json::Value {
             if let Some(streams) = data.get("streams").and_then(|v| v.as_array()) {
                 let video = streams
                     .iter()
-                    .find(|s| s.get("codec_type").and_then(|c| c.as_str()) == Some("video"));
+                    .find(|s| {
+                        s.get("codec_type").and_then(|c| c.as_str()) == Some("video")
+                            && s.pointer("/disposition/attached_pic").and_then(|v| v.as_i64()) != Some(1)
+                    });
                 let audio = streams
                     .iter()
                     .find(|s| s.get("codec_type").and_then(|c| c.as_str()) == Some("audio"));
 
+                for (kind, key) in [("video", "video_duration"), ("audio", "audio_duration")] {
+                    let longest = streams
+                        .iter()
+                        .filter(|s| s.get("codec_type").and_then(|c| c.as_str()) == Some(kind))
+                        .filter_map(stream_duration)
+                        .fold(0.0, f64::max);
+                    if longest > 0.0 {
+                        info.insert(key.to_string(), longest.into());
+                    }
+                }
+
                 if let Some(v) = video {
+                    for key in ["width", "height", "pix_fmt", "color_transfer"] {
+                        if let Some(value) = v.get(key) {
+                            info.insert(key.to_string(), value.clone());
+                        }
+                    }
                     if let (Some(w), Some(h)) = (v.get("width"), v.get("height")) {
                         info.insert(
                             "resolution".to_string(),
@@ -174,27 +193,43 @@ pub fn probe_info_sync(path: &str) -> serde_json::Value {
     serde_json::Value::Object(info)
 }
 
-pub fn probe_duration(path: &str) -> f64 {
-    let mut cmd = Command::new(ffprobe_exe());
-    cmd.args([
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        path,
-    ]);
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-
-    if let Ok(output) = cmd.output() {
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if let Ok(val) = text.parse::<f64>() {
-            return val;
+/// Duration the output should have, based on the streams actually exported (0 = unknown).
+pub fn expected_duration(info: &serde_json::Value, export_video: bool, export_audio: bool) -> f64 {
+    let seconds = |key: &str| info.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    match (export_video, export_audio) {
+        (true, true) => {
+            let longest = seconds("video_duration").max(seconds("audio_duration"));
+            if longest > 0.0 { longest } else { seconds("duration_seconds") }
         }
+        (true, false) => seconds("video_duration"),
+        _ => seconds("audio_duration"),
     }
-    0.0
+}
+
+fn stream_duration(stream: &serde_json::Value) -> Option<f64> {
+    if let Some(value) = stream.get("duration").and_then(|v| v.as_str()) {
+        return value.parse().ok();
+    }
+    // Matroska stores it as a "HH:MM:SS.nnn" tag.
+    stream
+        .get("tags")
+        .and_then(|t| t.get("DURATION"))
+        .and_then(|v| v.as_str())?
+        .split(':')
+        .try_fold(0.0, |total, part| part.parse::<f64>().ok().map(|n| total * 60.0 + n))
+}
+
+/// Identity of a file on disk: resolves mapped drives, `..` and letter case, existing or not.
+pub fn path_key(path: &str) -> String {
+    let path = Path::new(path);
+    let resolved = std::fs::canonicalize(path).or_else(|_| {
+        std::fs::canonicalize(path.parent().unwrap_or_else(|| Path::new("")))
+            .map(|parent| parent.join(path.file_name().unwrap_or_default()))
+    });
+    resolved
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_lowercase()
 }
 
 pub fn validate_output(path: &str, expected: f64) -> Result<(), String> {
@@ -261,7 +296,7 @@ pub fn make_unique_existing_path(output: &str, reserved_outputs: &HashSet<String
             .join(format!("{}_{:03}.{}", stem, counter, ext))
             .to_string_lossy()
             .to_string();
-        if !reserved_outputs.contains(&candidate.to_lowercase()) && !Path::new(&candidate).exists() {
+        if !reserved_outputs.contains(&path_key(&candidate)) && !Path::new(&candidate).exists() {
             return candidate;
         }
         counter += 1;
@@ -306,20 +341,20 @@ pub fn build_output_path(
     let suffix = if output_mode == "same_folder" { "_encoded" } else { "" };
 
     let mut candidate = out_folder.join(format!("{}{}{}", stem, suffix, ext));
-    if candidate.to_string_lossy().to_lowercase() == source.to_lowercase() {
+    if path_key(&candidate.to_string_lossy()) == path_key(source) {
         candidate = out_folder.join(format!("{}_encoded{}", stem, ext));
     }
 
     let mut final_str = candidate.to_string_lossy().to_string();
     let mut counter = 1usize;
-    while reserved_outputs.contains(&final_str.to_lowercase()) {
+    while reserved_outputs.contains(&path_key(&final_str)) {
         final_str = out_folder
             .join(format!("{}_{:03}{}", stem, counter, ext))
             .to_string_lossy()
             .to_string();
         counter += 1;
     }
-    reserved_outputs.insert(final_str.to_lowercase());
+    reserved_outputs.insert(path_key(&final_str));
     final_str
 }
 
@@ -349,10 +384,12 @@ pub fn build_ffmpeg_args(
     ];
 
     if export_video {
-        args.extend(["-map".to_string(), "0:v:0?".to_string()]);
+        args.extend(["-map".to_string(), "0:V:0?".to_string()]);
     }
     if export_audio {
-        args.extend(["-map".to_string(), "0:a?".to_string()]);
+        // MP3 and WAV hold exactly one audio stream.
+        let audio = if matches!(fmt, "mp3" | "wav") { "0:a:0?" } else { "0:a?" };
+        args.extend(["-map".to_string(), audio.to_string()]);
     }
 
     if settings.get("copyMetadata").and_then(|v| v.as_bool()).unwrap_or(true) {
@@ -366,9 +403,31 @@ pub fn build_ffmpeg_args(
         args.push("-an".to_string());
     }
 
+    let info = |key: &str| item.get("info").and_then(|i| i.get(key));
+    let hdr = matches!(
+        info("color_transfer").and_then(|v| v.as_str()),
+        Some("smpte2084" | "arib-std-b67")
+    );
     if export_video {
-        if let Some(res_args) = get_resolution_args(settings, item) {
-            args.extend(res_args);
+        let mut filters = Vec::new();
+        if hdr && matches!(fmt, "h264_mp4" | "mov_h264") {
+            // H.264 output is 8-bit SDR, so HDR must be tone-mapped rather than relabelled.
+            filters.push(
+                "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+                    .to_string(),
+            );
+        }
+        let odd = ["width", "height"]
+            .iter()
+            .any(|key| info(key).and_then(|v| v.as_i64()).unwrap_or(0) % 2 != 0);
+        if let Some(resize) = get_resolution_filter(settings, item) {
+            filters.push(resize);
+        } else if odd && matches!(fmt, "h265_mp4" | "h264_mp4" | "mov_h264") {
+            // 4:2:0 encoders need even dimensions.
+            filters.push("crop=trunc(iw/2)*2:trunc(ih/2)*2".to_string());
+        }
+        if !filters.is_empty() {
+            args.extend(["-vf".to_string(), filters.join(",")]);
         }
         if let Some(fps_args) = get_fps_args(settings, item) {
             args.extend(fps_args);
@@ -393,7 +452,8 @@ pub fn build_ffmpeg_args(
                         _ => "22",
                     };
                     args.extend([
-                        "-c:v", "libx265", "-preset", "medium", "-crf", crf, "-pix_fmt", "yuv420p",
+                        "-c:v", "libx265", "-preset", "medium", "-crf", crf, "-pix_fmt",
+                        if hdr { "yuv420p10le" } else { "yuv420p" },
                     ].map(str::to_string));
                 } else {
                     let cq = match preset {
@@ -405,9 +465,10 @@ pub fn build_ffmpeg_args(
                     args.extend([
                         "-c:v", "hevc_nvenc", "-preset", "p5", "-tune", "hq", "-rc", "vbr",
                         "-cq:v", cq, "-b:v", "0", "-spatial-aq", "1", "-aq-strength", "8",
-                        "-pix_fmt", "yuv420p",
+                        "-pix_fmt", if hdr { "p010le" } else { "yuv420p" },
                     ].map(str::to_string));
                 }
+                args.extend(["-tag:v", "hvc1"].map(str::to_string));
             }
             if export_audio {
                 args.extend(["-c:a", "aac", "-b:a", "192k"].map(str::to_string));
@@ -496,7 +557,11 @@ pub fn build_ffmpeg_args(
                 ].map(str::to_string));
             }
             if export_audio {
-                args.extend(["-c:a", "libopus", "-b:a", "128k"].map(str::to_string));
+                // libopus rejects side-channel layouts such as 5.1(side).
+                args.extend([
+                    "-c:a", "libopus", "-b:a", "128k",
+                    "-af", "aformat=channel_layouts=7.1|5.1|5.0|quad|3.0|stereo|mono",
+                ].map(str::to_string));
             }
         }
         _ => {
@@ -532,10 +597,10 @@ pub fn build_ffmpeg_args(
     args
 }
 
-pub fn get_resolution_args(
+pub fn get_resolution_filter(
     settings: &serde_json::Value,
     item: &serde_json::Value,
-) -> Option<Vec<String>> {
+) -> Option<String> {
     let mode = item
         .get("resolutionMode")
         .or(settings.get("resolutionMode"))
@@ -566,7 +631,10 @@ pub fn get_resolution_args(
     if width >= 16 && height >= 16 {
         let w = width - (width % 2);
         let h = height - (height % 2);
-        Some(vec!["-vf".to_string(), format!("scale={}:{}", w, h)])
+        // Fit inside the frame with black bars: never stretch or crop the picture.
+        Some(format!(
+            "scale=iw*sar:ih,setsar=1,scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+        ))
     } else {
         None
     }

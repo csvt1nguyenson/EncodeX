@@ -1,3 +1,4 @@
+import { version } from "../../package.json";
 import { FolderSearch, PowerOff, SlidersHorizontal } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -355,7 +356,7 @@ export function SettingsSidebar(props: SettingsSidebarProps) {
           )}
         </SectionCard>
 
-        <p className="px-1 text-center text-[10px] text-zinc-600">EncodeX 0.4.0 · Tauri v2</p>
+        <p className="px-1 text-center text-[10px] text-zinc-600">EncodeX {version} · Tauri v2</p>
       </div>
     </aside>
   );

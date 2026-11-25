@@ -52,7 +52,7 @@ function makeItem(overrides: Partial<QueueItem> = {}): QueueItem {
   };
 }
 
-describe("EncodeX 0.4.0 core queue & path logic", () => {
+describe("EncodeX core queue & path logic", () => {
   it("defaults start with H.265 High Quality, NVENC, FolderName_OUTPUT, Auto Rename, 1 job", () => {
     const s = createDefaultSettings();
     expect(s.format).toBe("h265_mp4");
@@ -153,6 +153,7 @@ describe("EncodeX 0.4.0 core queue & path logic", () => {
       outputMode: "custom_folder",
       customFolder: "Y:\\Out",
     });
+    expect(resolveCustomFolderUpdate("D:/My ").customFolder).toBe("D:\\My ");
     expect(resolveCustomFolderUpdate("   ")).toEqual({
       outputMode: "source_output",
       customFolder: "",
@@ -240,6 +241,15 @@ describe("EncodeX 0.4.0 core queue & path logic", () => {
     expect(resetSelectedItems([makeItem({ status: "Done" })], new Set([0]), s, true)[0].status).toBe(
       "Done"
     );
+  });
+
+  it("applies settings to Waiting and Failed items but never to Done", () => {
+    const s = { ...createDefaultSettings(), format: "mp3" as const };
+    const queue = (["Waiting", "Failed", "Stopped", "Done"] as const).map((status) =>
+      makeItem({ source: status, status, format: "h264_mp4" })
+    );
+    const updated = applySettingsToSelected(queue, new Set([0, 1, 2, 3]), s, false);
+    expect(updated.map((x) => x.format)).toEqual(["mp3", "mp3", "mp3", "h264_mp4"]);
   });
 
   it("manual Load Queue preserves Done/Skipped/Failed and resets interrupted items", () => {

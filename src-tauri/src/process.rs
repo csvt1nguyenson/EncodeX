@@ -5,6 +5,39 @@ use crate::state::{write_log, AppState};
 #[cfg(target_os = "windows")]
 pub const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+/// Put FFmpeg in a kill-on-close job so it cannot outlive a crashed app.
+#[cfg(target_os = "windows")]
+pub fn kill_with_app(child: &std::process::Child) {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    static JOB: OnceLock<usize> = OnceLock::new();
+    unsafe {
+        // The handle is intentionally never closed: Windows closes it when the app dies.
+        let job = *JOB.get_or_init(|| {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            job as usize
+        });
+        AssignProcessToJobObject(job as _, child.as_raw_handle() as _);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn kill_with_app(_child: &std::process::Child) {}
+
 #[cfg(target_os = "windows")]
 extern "system" {
     fn GetModuleHandleA(lpModuleName: *const u8) -> isize;

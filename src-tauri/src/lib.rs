@@ -62,7 +62,15 @@ pub fn run() {
     // Ensure no FFmpeg child processes stay alive or suspended when the app exits.
     app.run(|app_handle, event| {
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
-            stop_all(&app_handle.state::<AppState>());
+            let state = app_handle.state::<AppState>();
+            stop_all(&state);
+            // Give workers up to 5 seconds to delete their partial files.
+            for _ in 0..100 {
+                if !state.0.lock().unwrap().running {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
     });
 }
@@ -81,12 +89,12 @@ mod tests {
 
     use crate::ffmpeg::{
         build_ffmpeg_args, build_output_path, compute_active_elapsed_secs, concurrent_jobs,
-        get_resolution_args, publish_output, validate_output,
+        expected_duration, get_resolution_filter, path_key, probe_info_sync, publish_output, validate_output,
     };
     #[cfg(target_os = "windows")]
     use crate::process::CREATE_NO_WINDOW;
     use crate::process::{set_queue_paused, stop_all};
-    use crate::queue::run_pool;
+    use crate::queue::{run_one_job, run_pool};
     use crate::state::{write_log, AppState};
     use crate::tools::{ffmpeg_exe, ffprobe_exe, find_tool_pair, has_tool_pair, media_tools_directory};
     use crate::updater::{is_allowed_github_url, is_newer_version, parse_github_release};
@@ -108,8 +116,8 @@ mod tests {
     fn custom_resolution_accepts_ui_strings_and_rounds_even() {
         let settings = serde_json::json!({"resolutionMode":"custom", "customWidth":"1281", "customHeight":"721"});
         assert_eq!(
-            get_resolution_args(&settings, &serde_json::json!({})).unwrap(),
-            vec!["-vf", "scale=1280:720"]
+            get_resolution_filter(&settings, &serde_json::json!({})).unwrap(),
+            "scale=iw*sar:ih,setsar=1,scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1"
         );
     }
 
@@ -120,7 +128,7 @@ mod tests {
             let item = serde_json::json!({"format": fmt, "exportVideo": true, "exportAudio": true});
             let args = build_ffmpeg_args("in.mp4", "out.audio", &settings, &item);
             assert!(args.contains(&"-vn".to_string()), "{fmt} must pass -vn");
-            assert!(!args.contains(&"0:v:0?".to_string()), "{fmt} must not map video");
+            assert!(!args.contains(&"0:V:0?".to_string()), "{fmt} must not map video");
             assert!(!args.contains(&"-vf".to_string()), "{fmt} must not scale video");
         }
     }
@@ -209,6 +217,153 @@ mod tests {
         std::fs::write(&invalid, b"broken").unwrap();
         assert!(validate_output(invalid.to_str().unwrap(), 1.0).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn ffmpeg(args: &[&str]) {
+        let output = Command::new(ffmpeg_exe())
+            .args(["-nostdin", "-v", "error", "-y"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    /// Runs one job to the end; fails instead of hanging if the job never finishes.
+    fn finish_job(source: &Path, item: serde_json::Value, action: &str) -> serde_json::Value {
+        let dir = source.parent().unwrap().to_path_buf();
+        let state = AppState::new();
+        {
+            let mut inner = state.0.lock().unwrap();
+            let log = dir.join("job.log");
+            std::fs::write(&log, "").unwrap();
+            inner.log_file = Some(log.to_string_lossy().to_string());
+        }
+        let mut item = item;
+        item["source"] = source.to_string_lossy().to_string().into();
+        item["status"] = "Ready".into();
+        let settings = serde_json::json!({
+            "renderer": "cpu",
+            "outputMode": "custom_folder",
+            "customFolder": dir.join("out").to_string_lossy(),
+            "existingAction": action
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let last = Mutex::new(serde_json::Value::Null);
+            let emit = |event: &str, data: serde_json::Value| {
+                if event == "queue-update" {
+                    *last.lock().unwrap() = data["data"].clone();
+                }
+            };
+            run_one_job(&emit, &state, &settings, &item, 0, 1, &Mutex::new(HashSet::new()));
+            let result = last.lock().unwrap().clone();
+            tx.send(result).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(60)).expect("job never finished")
+    }
+
+    #[test]
+    fn job_finishes_and_handles_awkward_sources() {
+        let dir = scratch();
+        let path = |name: &str| dir.join(name);
+        let text = |name: &str| dir.join(name).to_string_lossy().to_string();
+
+        // Short audio, two audio tracks and odd dimensions.
+        ffmpeg(&[
+            "-f", "lavfi", "-i", "testsrc=s=161x91:r=10:d=8", "-f", "lavfi", "-i", "sine=d=2",
+            "-f", "lavfi", "-i", "sine=d=2", "-map", "0", "-map", "1", "-map", "2",
+            "-c:v", "ffv1", "-pix_fmt", "yuv444p", "-c:a", "pcm_s16le", &text("a.mkv"),
+        ]);
+        for format in ["h264_mp4", "h265_mp4", "mp3", "wav", "aac"] {
+            let done = finish_job(&path("a.mkv"), serde_json::json!({"format": format}), "autorename");
+            assert_eq!(done["status"], "Done", "{format}: {done}");
+        }
+
+        // Cover art is not video.
+        ffmpeg(&[
+            "-f", "lavfi", "-i", "sine=d=1", "-f", "lavfi", "-i", "color=s=64x64:d=1:r=1",
+            "-map", "0", "-map", "1", "-c:a", "libmp3lame", "-c:v", "mjpeg",
+            "-disposition:v", "attached_pic", &text("cover.mp3"),
+        ]);
+        let done = finish_job(&path("cover.mp3"), serde_json::json!({"format": "h265_mp4"}), "autorename");
+        assert_eq!(done["status"], "Done", "{done}");
+
+        // 5.1(side) audio to Opus.
+        ffmpeg(&["-f", "lavfi", "-i", "anullsrc=cl=5.1(side):d=1", "-c:a", "pcm_s16le", &text("side.wav")]);
+        let done = finish_job(&path("side.wav"), serde_json::json!({"format": "webm"}), "autorename");
+        assert_eq!(done["status"], "Done", "{done}");
+
+        // A missing source fails and leaves no partial file.
+        let failed = finish_job(&path("missing.mov"), serde_json::json!({"format": "h264_mp4"}), "autorename");
+        assert_eq!(failed["status"], "Failed");
+
+        // A publish failure keeps the finished encode (a directory blocks the output name).
+        std::fs::create_dir_all(path("out").join("side.mp3")).unwrap();
+        let failed = finish_job(&path("side.wav"), serde_json::json!({"format": "mp3"}), "overwrite");
+        assert_eq!(failed["status"], "Failed", "{failed}");
+        assert!(failed["error"].as_str().unwrap().contains("kept at"), "{failed}");
+        let parts = std::fs::read_dir(path("out"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".part."))
+            .count();
+        assert_eq!(parts, 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn output_never_lands_on_another_queued_source() {
+        let dir = scratch();
+        let other = dir.join("clip.mp4");
+        std::fs::write(&other, b"original").unwrap();
+        // The same folder spelled differently is still the same file.
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let custom = dir.join("sub").join("..");
+        let settings = serde_json::json!({
+            "outputMode": "custom_folder",
+            "customFolder": custom.to_string_lossy()
+        });
+        let mut reserved = HashSet::from([path_key(&other.to_string_lossy())]);
+        let output = build_output_path(
+            dir.join("clip.mov").to_str().unwrap(),
+            &settings,
+            &serde_json::json!({"format": "h264_mp4"}),
+            &mut reserved,
+        );
+        assert_ne!(path_key(&output), path_key(&other.to_string_lossy()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn hdr_keeps_10_bit_in_hevc_and_tonemaps_in_h264() {
+        let dir = scratch();
+        let src = dir.join("hdr.mp4").to_string_lossy().to_string();
+        ffmpeg(&[
+            "-f", "lavfi", "-i", "testsrc=s=160x90:r=10:d=1", "-vf", "format=yuv420p10le",
+            "-c:v", "libx265", "-x265-params",
+            "log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc", &src,
+        ]);
+        let cases = [("h265_mp4", "yuv420p10le", "smpte2084"), ("h264_mp4", "yuv420p", "bt709")];
+        for (format, depth, transfer) in cases {
+            let item = serde_json::json!({"format": format, "info": probe_info_sync(&src)});
+            let out = dir.join(format!("{format}.mp4")).to_string_lossy().to_string();
+            let args = build_ffmpeg_args(&src, &out, &serde_json::json!({"renderer": "cpu"}), &item);
+            ffmpeg(&args.iter().map(String::as_str).collect::<Vec<_>>());
+            let info = probe_info_sync(&out);
+            assert_eq!(info["pix_fmt"], depth);
+            assert_eq!(info["color_transfer"], transfer);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn expected_duration_follows_exported_streams() {
+        let info = serde_json::json!({"duration_seconds": 20.0, "video_duration": 20.0, "audio_duration": 5.0});
+        assert_eq!(expected_duration(&info, false, true), 5.0);
+        assert_eq!(expected_duration(&info, true, true), 20.0);
+        let unknown = serde_json::json!({"duration_seconds": 20.0});
+        assert_eq!(expected_duration(&unknown, true, true), 20.0);
+        assert_eq!(expected_duration(&unknown, false, true), 0.0);
     }
 
     #[test]

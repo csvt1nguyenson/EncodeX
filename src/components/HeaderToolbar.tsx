@@ -14,6 +14,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import { version } from "../../package.json";
 import logoUrl from "@/assets/logo.png";
 import { Button } from "@/components/ui/button";
 import {
@@ -56,7 +57,7 @@ export function HeaderToolbar(props: HeaderToolbarProps) {
         <div className="hidden sm:flex items-center gap-2">
           <span className="text-sm font-semibold tracking-tight text-zinc-100">EncodeX</span>
           <span className="rounded border border-zinc-800 bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-zinc-400">
-            0.4.0
+            {version}
           </span>
           {availableUpdate && (
             <button

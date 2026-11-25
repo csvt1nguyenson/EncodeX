@@ -23,10 +23,6 @@ import type {
 const UNFINISHED_STATUSES = new Set<JobStatus>(["Ready", "Waiting", "Failed", "Stopped"]);
 const PRESERVED_LOAD_STATUSES = new Set<JobStatus>(["Done", "Skipped", "Failed"]);
 
-export function canChangeJob(item: QueueItem | undefined): boolean {
-  return Boolean(item && item.status === "Ready");
-}
-
 export function isEditableTarget(target: EventTarget | null): boolean {
   if (!target || typeof target !== "object") return false;
   const el = target as {
@@ -166,7 +162,7 @@ export function applySettingsToSelected(
   if (isRunning || selectedIndices.size === 0) return queue;
   let changed = false;
   const next = queue.map((item, idx) => {
-    if (!selectedIndices.has(idx) || !canChangeJob(item)) return item;
+    if (!selectedIndices.has(idx) || !UNFINISHED_STATUSES.has(item.status)) return item;
     changed = true;
     const exportVideo = isAudioOnlyFormat(settings.format) ? false : settings.exportVideo;
     const updated: QueueItem = {
@@ -227,7 +223,9 @@ export function resolveCustomFolderUpdate(rawValue: string): {
   if (!folder) {
     return { outputMode: "source_output", customFolder: "" };
   }
-  return { outputMode: "custom_folder", customFolder: folder };
+  // Keep trailing spaces so folder names with spaces can be typed; Rust trims before use.
+  const typed = rawValue.trim().startsWith('"') ? folder : rawValue.trimStart().replace(/\//g, "\\");
+  return { outputMode: "custom_folder", customFolder: typed };
 }
 
 export function resetSelectedItems(

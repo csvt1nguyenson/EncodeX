@@ -59,7 +59,7 @@ pub fn write_log(state: &AppState, text: &str) {
             let log_file_path = log_dir.join(format!("encode_log_{}.txt", timestamp));
 
             if let Ok(mut f) = std::fs::File::create(&log_file_path) {
-                let _ = writeln!(f, "EncodeX 0.4.0 Log (Rust Tauri)");
+                let _ = writeln!(f, "EncodeX {} Log (Rust Tauri)", env!("CARGO_PKG_VERSION"));
                 let _ = writeln!(f, "Started: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
                 let _ = writeln!(f, "{}", "=".repeat(80));
                 inner.log_file = Some(log_file_path.to_string_lossy().to_string());

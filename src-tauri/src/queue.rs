@@ -13,12 +13,12 @@ use tauri::{AppHandle, Emitter};
 
 use crate::ffmpeg::{
     build_ffmpeg_args, build_output_path, compute_active_elapsed_secs, concurrent_jobs, format_eta,
-    is_audio_only_format, make_unique_existing_path, probe_duration, publish_output, size_result,
-    validate_output,
+    expected_duration, is_audio_only_format, make_unique_existing_path, path_key, probe_info_sync,
+    publish_output, size_result, validate_output,
 };
 #[cfg(target_os = "windows")]
 use crate::process::CREATE_NO_WINDOW;
-use crate::process::suspend_process;
+use crate::process::{kill_with_app, suspend_process};
 use crate::state::{current_paused_duration, write_log, AppState};
 use crate::tools::ffmpeg_exe;
 
@@ -52,8 +52,10 @@ pub fn run_pool<F: Fn(usize) + Sync>(state: &AppState, count: usize, limit: usiz
     });
 }
 
-fn update_item_ui(app: &AppHandle, index: usize, data: serde_json::Value) {
-    let _ = app.emit(
+pub type Emit<'a> = &'a (dyn Fn(&str, serde_json::Value) + Sync);
+
+fn update_item_ui(app: Emit, index: usize, data: serde_json::Value) {
+    app(
         "queue-update",
         serde_json::json!({
             "index": index,
@@ -72,12 +74,22 @@ pub fn run_queue_worker(
         &state,
         &format!("Queue started. Concurrent jobs: {}", concurrent_jobs(&settings)),
     );
-    let reserved_outputs = Mutex::new(HashSet::new());
+    let emit = |event: &str, data: serde_json::Value| {
+        let _ = app.emit(event, data);
+    };
+    // Outputs must never land on any queued source, even in overwrite mode.
+    let reserved_outputs = Mutex::new(
+        queue
+            .iter()
+            .filter_map(|item| item.get("source").and_then(|v| v.as_str()))
+            .map(path_key)
+            .collect::<HashSet<_>>(),
+    );
     let completed = AtomicUsize::new(0);
 
     run_pool(&state, queue.len(), concurrent_jobs(&settings), |index| {
         let result = run_one_job(
-            &app,
+            &emit,
             &state,
             &settings,
             &queue[index],
@@ -111,8 +123,8 @@ pub fn run_queue_worker(
     write_log(&state, if stopped { "Queue stopped." } else { "Queue finished." });
 }
 
-fn run_one_job(
-    app: &AppHandle,
+pub fn run_one_job(
+    app: Emit,
     state: &AppState,
     settings: &serde_json::Value,
     item: &serde_json::Value,
@@ -188,7 +200,7 @@ fn run_one_job(
                 OutputDecision::Skip(initial)
             } else if existing_action == "autorename" {
                 let renamed_path = make_unique_existing_path(&initial, &reservations);
-                reservations.insert(renamed_path.to_lowercase());
+                reservations.insert(path_key(&renamed_path));
                 OutputDecision::Encode {
                     initial,
                     final_path: renamed_path,
@@ -247,7 +259,7 @@ fn run_one_job(
                 }),
             );
             let filename = Path::new(source).file_name().and_then(|s| s.to_str()).unwrap_or("");
-            let _ = app.emit("active-job", filename);
+            app("active-job", filename.into());
             job_log("");
             job_log(&format!("[{}/{}] Source: {}", index + 1, total, source));
             if renamed {
@@ -259,7 +271,11 @@ fn run_one_job(
         }
     };
 
-    let duration = probe_duration(source);
+    // Probe fresh: the queue may come from a saved file with outdated media info.
+    let info = probe_info_sync(source);
+    let duration = expected_duration(&info, export_video, export_audio);
+    let mut item = item.clone();
+    item["info"] = info;
     let temp_path = Path::new(&final_output);
     let temporary = temp_path
         .with_file_name(format!(
@@ -272,7 +288,7 @@ fn run_one_job(
         .to_string_lossy()
         .to_string();
 
-    let cmd_args = build_ffmpeg_args(source, &temporary, settings, item);
+    let cmd_args = build_ffmpeg_args(source, &temporary, settings, &item);
     job_log("Command:");
     job_log(&format!("ffmpeg {}", cmd_args.join(" ")));
 
@@ -303,11 +319,14 @@ fn run_one_job(
         }
     };
 
+    kill_with_app(&child);
     let stderr = child.stderr.take().unwrap();
     let log_state = state.clone_shared();
     let error_reader = std::thread::spawn(move || {
         let mut tail = VecDeque::new();
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        // Split on bytes: media metadata may not be valid UTF-8 and must not end the log early.
+        for line in BufReader::new(stderr).split(b'\n').map_while(Result::ok) {
+            let line = String::from_utf8_lossy(&line).trim_end().to_string();
             write_log(&log_state, &format!("[Job {}] {}", index + 1, line));
             tail.push_back(line);
             if tail.len() > 12 {
@@ -401,7 +420,9 @@ fn run_one_job(
     };
 
     let mut completed = 0usize;
-    if let Some(mut c) = state.0.lock().unwrap().children.remove(&index) {
+    // Separate statement: an `if let` scrutinee would hold the lock for the whole body and deadlock.
+    let child = state.0.lock().unwrap().children.remove(&index);
+    if let Some(mut c) = child {
         if exit_status.is_err() {
             let _ = c.kill();
             let _ = c.wait();
@@ -423,13 +444,30 @@ fn run_one_job(
             let _ = std::fs::remove_file(&temporary);
         } else if let Ok(status) = exit_status {
             let validation = if status.success() {
-                validate_output(&temporary, duration)
-                    .and_then(|_| publish_output(&temporary, &final_output, existing_action == "overwrite"))
+                validate_output(&temporary, duration).map_err(|e| (e, false)).and_then(|_| {
+                    publish_output(&temporary, &final_output, existing_action == "overwrite")
+                        .map_err(|e| (format!("{}. Encoded file kept at: {}", e, temporary), true))
+                })
             } else {
-                Err(format!("FFmpeg {}: {}", status, error_text))
+                Err((format!("FFmpeg {}: {}", status, error_text), false))
             };
 
-            if validation.is_ok() {
+            if let Err((reason, keep_encoded)) = validation {
+                update_item_ui(
+                    app,
+                    index,
+                    serde_json::json!({
+                        "status": "Failed",
+                        "progress": 0,
+                        "eta": "--",
+                        "error": reason
+                    }),
+                );
+                job_log(&format!("FAILED: {}", reason));
+                if !keep_encoded {
+                    let _ = std::fs::remove_file(&temporary);
+                }
+            } else {
                 completed = 1;
                 let mut data = serde_json::json!({
                     "output": final_output,
@@ -446,20 +484,6 @@ fn run_one_job(
                 }
                 update_item_ui(app, index, data);
                 job_log("OK.");
-            } else {
-                let reason = validation.unwrap_err();
-                update_item_ui(
-                    app,
-                    index,
-                    serde_json::json!({
-                        "status": "Failed",
-                        "progress": 0,
-                        "eta": "--",
-                        "error": reason
-                    }),
-                );
-                job_log(&format!("FAILED: {}", reason));
-                let _ = std::fs::remove_file(&temporary);
             }
         }
     }

@@ -50,7 +50,7 @@ function blurActiveElement() {
 
 export function useEncodeX() {
   const [settings, setSettings] = useState<ExportSettings>(createDefaultSettings);
-  const [queue, setQueue] = useState<QueueItem[]>([]);
+  const [queue, setQueueState] = useState<QueueItem[]>([]);
   const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set());
   const [lastSelectedIndex, setLastSelectedIndex] = useState(-1);
   const [isRunning, setIsRunning] = useState(false);
@@ -67,7 +67,11 @@ export function useEncodeX() {
   const [checkingUpdate, setCheckingUpdate] = useState(false);
 
   const queueRef = useRef(queue);
-  queueRef.current = queue;
+  // The ref updates synchronously, so back-to-back backend events never see a stale queue.
+  const setQueue = useCallback((update: QueueItem[] | ((prev: QueueItem[]) => QueueItem[])) => {
+    queueRef.current = typeof update === "function" ? update(queueRef.current) : update;
+    setQueueState(queueRef.current);
+  }, []);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
   const selectedRef = useRef(selectedIndices);
@@ -262,6 +266,7 @@ export function useEncodeX() {
       return;
     }
 
+    isRunningRef.current = true;
     setIsRunning(true);
     setIsPaused(false);
     setBadge("ENCODING");
@@ -551,6 +556,7 @@ export function useEncodeX() {
     async (paths: string[]) => {
       if (isRunningRef.current || paths.length === 0) return;
       await ensureMediaTools();
+      if (isRunningRef.current) return;
 
       const { nextQueue, addedPaths, newSelection } = createQueueItemsFromPaths(
         queueRef.current,
@@ -564,7 +570,6 @@ export function useEncodeX() {
       }
 
       const generation = probeGenerationRef.current;
-      queueRef.current = nextQueue;
       setQueue(nextQueue);
       setSelectedIndices(newSelection);
       setLastSelectedIndex(nextQueue.length - 1);
