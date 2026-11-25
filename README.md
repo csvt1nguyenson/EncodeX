@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/csvt1nguyenson/EncodeX/releases/latest">
-    <img src="https://img.shields.io/badge/Download-Windows%20x64%20(v0.4.0)-06B6D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download EncodeX for Windows x64" />
+    <img src="https://img.shields.io/badge/Download-Windows%20x64%20(v0.4.1)-06B6D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download EncodeX for Windows x64" />
   </a>
 </p>
 
@@ -19,7 +19,7 @@
 
 ## Download & Install
 
-1. Download **`EncodeX_0.4.0_x64-setup.exe`** from the [**Latest Release**](https://github.com/csvt1nguyenson/EncodeX/releases/latest).
+1. Download **`EncodeX_0.4.1_x64-setup.exe`** from the [**Latest Release**](https://github.com/csvt1nguyenson/EncodeX/releases/latest).
 2. Run the installer and follow the on-screen steps.
 3. **FFmpeg & FFprobe are set up automatically:** if your PC does not already have them installed, the installer downloads and verifies an official essentials build for you *(Internet connection required on first setup)*.
 
