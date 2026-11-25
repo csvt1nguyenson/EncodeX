@@ -37,6 +37,9 @@ import type {
   UpdateCheckResult,
 } from "@/lib/types";
 
+// GitHub allows 60 anonymous requests per hour per IP, shared by every PC in the office.
+const UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000;
+
 export interface AlertState {
   title: string;
   message: string;
@@ -82,6 +85,7 @@ export function useEncodeX() {
   hasOpenDialogRef.current = confirmClearOpen || alertDialog !== null || updateDialogOpen;
 
   const mediaToolsPromiseRef = useRef<Promise<string> | null>(null);
+  const notifiedVersionRef = useRef("");
   const probeGenerationRef = useRef(0);
   const pendingLogsRef = useRef<Array<{ time?: string; message?: string }>>([]);
   const logRafRef = useRef<number | null>(null);
@@ -107,9 +111,13 @@ export function useEncodeX() {
       if (result.hasUpdate) {
         setAvailableUpdate(result);
         if (silent) {
-          toast.info(`Update available: v${result.latestVersion}`, {
-            description: "Click the Update badge in the header to download.",
-          });
+          if (notifiedVersionRef.current !== result.latestVersion) {
+            notifiedVersionRef.current = result.latestVersion;
+            toast.info(`Update available: v${result.latestVersion}`, {
+              duration: Infinity,
+              action: { label: "View", onClick: () => setUpdateDialogOpen(true) },
+            });
+          }
         } else {
           setUpdateDialogOpen(true);
         }
@@ -148,6 +156,8 @@ export function useEncodeX() {
       });
     });
     void checkForUpdates(true);
+    const timer = setInterval(() => void checkForUpdates(true), UPDATE_CHECK_INTERVAL_MS);
+    return () => clearInterval(timer);
   }, [ensureMediaTools, checkForUpdates]);
 
   useEffect(() => {
